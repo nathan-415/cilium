@@ -5,12 +5,11 @@ import (
 	"net"
 	"testing"
 
-	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
-	"github.com/cilium/cilium/pkg/lock"
-
 	"github.com/cilium/cilium/pkg/ipam/types"
 	ciliumv2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
+	"github.com/cilium/cilium/pkg/lock"
+
+	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	. "github.com/onsi/gomega"
 )
@@ -19,8 +18,10 @@ type fakeK8sCiliumNodeAPI struct {
 	mutex lock.Mutex
 	node  *ciliumv2.CiliumNode
 
-	onUpsert func(*ciliumv2.CiliumNode)
-	onDelete func()
+	onUpsert      func(*ciliumv2.CiliumNode)
+	onUpsertEvent func()
+	onDelete      func()
+	onDeleteEvent func()
 }
 
 // subscribe implements localNodeInformer
@@ -43,10 +44,14 @@ func (f *fakeK8sCiliumNodeAPI) updateNode(node *ciliumv2.CiliumNode) {
 	f.mutex.Lock()
 	onUpsert := f.onUpsert
 	f.node = node
+	onUpsertEvent := f.onUpsertEvent
 	f.mutex.Unlock()
 
 	if onUpsert != nil {
 		onUpsert(node)
+	}
+	if onUpsertEvent != nil {
+		onUpsertEvent()
 	}
 }
 
@@ -55,10 +60,14 @@ func (f *fakeK8sCiliumNodeAPI) deleteNode() {
 	f.mutex.Lock()
 	onDelete := f.onDelete
 	f.node = nil
+	onDeleteEvent := f.onDeleteEvent
 	f.mutex.Unlock()
 
 	if onDelete != nil {
 		onDelete()
+	}
+	if onDeleteEvent != nil {
+		onDeleteEvent()
 	}
 }
 
@@ -123,13 +132,7 @@ func TestPodCIDRPool(t *testing.T) {
 			Expect(p.release(tc.outOfRangeIP)).To(Succeed())
 
 			// Test allocation of all IPs.
-			ips := make([]net.IP, 0, tc.capacity)
-			for i := 0; i < tc.capacity; i++ {
-				ip, err := p.allocateNext()
-				Expect(err).ToNot(HaveOccurred())
-				Expect(ip).ToNot(BeNil())
-				ips = append(ips, ip)
-			}
+			ips := allocateNextN(p, tc.capacity, nil)
 
 			// Test behavior when full.
 			Expect(p.hasAvailableIPs()).To(BeFalse())
@@ -185,24 +188,21 @@ func TestPodCIDRPoolMultiplePools(t *testing.T) {
 		},
 		{
 			family:    IPv6,
-			podCIDR1:  "1::/124",
-			capacity1: 14,
-			podCIDR2:  "2::/124",
-			capacity2: 14,
+			podCIDR1:  "1::/123",
+			capacity1: 30,
+			podCIDR2:  "2::/123",
+			capacity2: 30,
 		},
 	} {
 		t.Run(string(tc.family), func(t *testing.T) {
 			RegisterTestingT(t)
 
 			p := newPodCIDRPool(tc.family)
-			p.updatePool([]string{tc.podCIDR1, tc.podCIDR2})
+			p.updatePool([]string{tc.podCIDR1})
 
 			// Test behavior with no allocations.
 			Expect(p.status()).To(Equal(types.UsedPodCIDRMap{
 				tc.podCIDR1: {
-					Status: types.PodCIDRStatusInUse,
-				},
-				tc.podCIDR2: {
 					Status: types.PodCIDRStatusInUse,
 				},
 			}))
@@ -220,14 +220,15 @@ func TestPodCIDRPoolMultiplePools(t *testing.T) {
 			Expect(p.release(ip)).To(Succeed())
 
 			// Test fully allocating the first pod CIDR.
-			ips1 := make([]net.IP, 0, tc.capacity1)
-			for i := 0; i < tc.capacity1; i++ {
-				ip, err := p.allocateNext()
-				Expect(err).ToNot(HaveOccurred())
-				Expect(ip).ToNot(BeNil())
-				Expect(podCIDR1.Contains(ip)).To(BeTrue())
-				ips1 = append(ips1, ip)
-			}
+			ips1 := allocateNextN(p, tc.capacity1, podCIDR1)
+			Expect(p.status()).To(Equal(types.UsedPodCIDRMap{
+				tc.podCIDR1: {
+					Status: types.PodCIDRStatusDepleted,
+				},
+			}))
+
+			// Allocate the second pod CIDR.
+			p.updatePool([]string{tc.podCIDR1, tc.podCIDR2})
 			Expect(p.status()).To(Equal(types.UsedPodCIDRMap{
 				tc.podCIDR1: {
 					Status: types.PodCIDRStatusDepleted,
@@ -238,14 +239,7 @@ func TestPodCIDRPoolMultiplePools(t *testing.T) {
 			}))
 
 			// Test fully allocating the second pod CIDR.
-			ips2 := make([]net.IP, 0, tc.capacity1)
-			for i := 0; i < tc.capacity2; i++ {
-				ip, err := p.allocateNext()
-				Expect(err).ToNot(HaveOccurred())
-				Expect(ip).ToNot(BeNil())
-				Expect(podCIDR2.Contains(ip)).To(BeTrue())
-				ips2 = append(ips2, ip)
-			}
+			ips2 := allocateNextN(p, tc.capacity2, podCIDR2)
 			Expect(p.status()).To(Equal(types.UsedPodCIDRMap{
 				tc.podCIDR1: {
 					Status: types.PodCIDRStatusDepleted,
@@ -267,9 +261,7 @@ func TestPodCIDRPoolMultiplePools(t *testing.T) {
 			Expect(ip).To(Equal(ips2[0]))
 
 			// Test fully releasing the second pod CIDR.
-			for _, ip := range ips2 {
-				Expect(p.release(ip)).To(Succeed())
-			}
+			releaseAll(p, ips2)
 			Expect(p.status()).To(Equal(types.UsedPodCIDRMap{
 				tc.podCIDR1: {
 					Status: types.PodCIDRStatusDepleted,
@@ -291,6 +283,8 @@ func TestPodCIDRPoolMultiplePools(t *testing.T) {
 				default:
 					expectedStatus2 = types.PodCIDRStatusInUse
 				}
+				// FIXME the following test fails, probably because the expected
+				// status of tc.podCIDR2 is not correct.
 				Expect(p.status()).To(Equal(types.UsedPodCIDRMap{
 					tc.podCIDR1: {
 						Status: types.PodCIDRStatusInUse,
@@ -305,10 +299,183 @@ func TestPodCIDRPoolMultiplePools(t *testing.T) {
 }
 
 func TestNewCRDWatcher(t *testing.T) {
-	RegisterTestingT(t)
+	for _, tc := range []struct {
+		family    Family
+		podCIDR1  string
+		capacity1 int
+		podCIDR2  string
+		capacity2 int
+	}{
+		{
+			family:    IPv4,
+			podCIDR1:  "0.0.0.0/27",
+			capacity1: 30,
+			podCIDR2:  "1.0.0.0/27",
+			capacity2: 30,
+		},
+		{
+			family:    IPv6,
+			podCIDR1:  "1::/123",
+			capacity1: 30,
+			podCIDR2:  "2::/123",
+			capacity2: 30,
+		},
+	} {
+		t.Run(string(tc.family), func(t *testing.T) {
+			RegisterTestingT(t)
 
-	Expect(func() {
-		mockNodeAPI := &fakeK8sCiliumNodeAPI{}
-		_ = newCRDWatcher(&ownerMock{}, mockNodeAPI, mockNodeAPI)
-	}).NotTo(Panic())
+			fakeK8sEventRegister := &ownerMock{}
+			events := make(chan string, 1)
+			fakeK8sCiliumNodeAPI := &fakeK8sCiliumNodeAPI{
+				onDeleteEvent: func() {
+					events <- "delete"
+				},
+				onUpsertEvent: func() {
+					events <- "upsert"
+				},
+			}
+
+			// Test that the watcher updates the CiliumNode CRD.
+			c := newCRDWatcher(fakeK8sEventRegister, fakeK8sCiliumNodeAPI, fakeK8sCiliumNodeAPI)
+			c.setPodCIDRPool(IPv4, newPodCIDRPool(IPv4))
+			c.setPodCIDRPool(IPv6, newPodCIDRPool(IPv6))
+			c.localNodeUpdated(&ciliumv2.CiliumNode{
+				Spec: ciliumv2.NodeSpec{
+					IPAM: types.IPAMSpec{
+						PodCIDRs: []string{
+							tc.podCIDR1,
+						},
+					},
+				},
+			})
+			c.controller.TriggerController("sync-clusterpool-status")
+			Expect(<-events).To(Equal("upsert"))
+			Expect(fakeK8sCiliumNodeAPI.node).NotTo(BeNil())
+			Expect(fakeK8sCiliumNodeAPI.node.Status.IPAM.UsedPodCIDRs).To(Equal(types.UsedPodCIDRMap{
+				tc.podCIDR1: types.UsedPodCIDR{
+					Status: types.PodCIDRStatusInUse,
+				},
+			}))
+
+			// Deplete all IPs in the first pod CIDR.
+			ip1s := allocateNextN(c.pools[tc.family], tc.capacity1, nil)
+			c.controller.TriggerController("sync-clusterpool-status")
+			Expect(<-events).To(Equal("upsert"))
+			Expect(fakeK8sCiliumNodeAPI.node.Status.IPAM.UsedPodCIDRs).To(Equal(types.UsedPodCIDRMap{
+				tc.podCIDR1: types.UsedPodCIDR{
+					Status: types.PodCIDRStatusDepleted,
+				},
+			}))
+
+			// Allocate the second pod CIDR.
+			c.localNodeUpdated(&ciliumv2.CiliumNode{
+				Spec: ciliumv2.NodeSpec{
+					IPAM: types.IPAMSpec{
+						PodCIDRs: []string{
+							tc.podCIDR1,
+							tc.podCIDR2,
+						},
+					},
+				},
+			})
+			c.controller.TriggerController("sync-clusterpool-status")
+			Expect(<-events).To(Equal("upsert"))
+			Expect(fakeK8sCiliumNodeAPI.node.Status.IPAM.UsedPodCIDRs).To(Equal(types.UsedPodCIDRMap{
+				tc.podCIDR1: types.UsedPodCIDR{
+					Status: types.PodCIDRStatusDepleted,
+				},
+				tc.podCIDR2: types.UsedPodCIDR{
+					Status: types.PodCIDRStatusInUse,
+				},
+			}))
+
+			// Allocate all IPs in the second pod CIDR.
+			ip2s := allocateNextN(c.pools[tc.family], tc.capacity2, nil)
+			c.controller.TriggerController("sync-clusterpool-status")
+			Expect(<-events).To(Equal("upsert"))
+			Expect(fakeK8sCiliumNodeAPI.node.Status.IPAM.UsedPodCIDRs).To(Equal(types.UsedPodCIDRMap{
+				tc.podCIDR1: types.UsedPodCIDR{
+					Status: types.PodCIDRStatusDepleted,
+				},
+				tc.podCIDR2: types.UsedPodCIDR{
+					Status: types.PodCIDRStatusDepleted,
+				},
+			}))
+
+			// Release all IPs in the second pod CIDR.
+			releaseAll(c.pools[tc.family], ip2s)
+			c.controller.TriggerController("sync-clusterpool-status")
+			Expect(<-events).To(Equal("upsert"))
+			Expect(fakeK8sCiliumNodeAPI.node.Status.IPAM.UsedPodCIDRs).To(Equal(types.UsedPodCIDRMap{
+				tc.podCIDR1: types.UsedPodCIDR{
+					Status: types.PodCIDRStatusDepleted,
+				},
+				tc.podCIDR2: types.UsedPodCIDR{
+					Status: types.PodCIDRStatusInUse,
+				},
+			}))
+
+			// Release all IPs in the first pod CIDR.
+			releaseAll(c.pools[tc.family], ip1s)
+			c.controller.TriggerController("sync-clusterpool-status")
+			Expect(<-events).To(Equal("upsert"))
+			// FIXME the following test fails. The wrong pod CIDR is marked as released.
+			Expect(fakeK8sCiliumNodeAPI.node.Status.IPAM.UsedPodCIDRs).To(Equal(types.UsedPodCIDRMap{
+				tc.podCIDR1: types.UsedPodCIDR{
+					Status: types.PodCIDRStatusInUse,
+				},
+				tc.podCIDR2: types.UsedPodCIDR{
+					Status: types.PodCIDRStatusReleased,
+				},
+			}))
+
+			// Deallocate the second pod CIDR.
+			c.localNodeUpdated(&ciliumv2.CiliumNode{
+				Spec: ciliumv2.NodeSpec{
+					IPAM: types.IPAMSpec{
+						PodCIDRs: []string{
+							tc.podCIDR1,
+						},
+					},
+				},
+			})
+			c.controller.TriggerController("sync-clusterpool-status")
+			Expect(<-events).To(Equal("upsert"))
+			// FIXME the following test fails. The wrong pod CIDR is marked as in-use.
+			Expect(fakeK8sCiliumNodeAPI.node.Status.IPAM.UsedPodCIDRs).To(Equal(types.UsedPodCIDRMap{
+				tc.podCIDR1: types.UsedPodCIDR{
+					Status: types.PodCIDRStatusInUse,
+				},
+			}))
+
+			// Delete the node.
+			fakeK8sCiliumNodeAPI.deleteNode()
+			c.controller.TriggerController("sync-clusterpool-status")
+			Expect(<-events).To(Equal("delete"))
+			Expect(fakeK8sCiliumNodeAPI.node).To(BeNil())
+		})
+	}
+}
+
+// allocateNextN allocates the next n IPs from pool. If cidr is not nil then it
+// expects that it will contain all allocated IPs.
+func allocateNextN(p *podCIDRPool, n int, cidr *net.IPNet) []net.IP {
+	ips := make([]net.IP, 0, n)
+	for i := 0; i < n; i++ {
+		ip, err := p.allocateNext()
+		Expect(err).ToNot(HaveOccurred())
+		Expect(ip).ToNot(BeNil())
+		if cidr != nil {
+			Expect(cidr.Contains(ip)).To(BeTrue())
+		}
+		ips = append(ips, ip)
+	}
+	return ips
+}
+
+// releaseAll releases ips from the pool. It expects that all releases succeed.
+func releaseAll(p *podCIDRPool, ips []net.IP) {
+	for _, ip := range ips {
+		Expect(p.release(ip)).To(Succeed())
+	}
 }
